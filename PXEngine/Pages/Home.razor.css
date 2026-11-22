@@ -1,0 +1,20 @@
+.px-toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-bottom: 6px;
+}
+
+.px-info {
+    font-size: 0.9rem;
+    color: #555;
+    margin-bottom: 6px;
+}
+
+canvas {
+    width: 100%;
+    height: 65vh;
+    display: block;
+    touch-action: none;
+    border-radius: 8px;
+}

@@ -1,19 +1,175 @@
 ﻿@page "/"
+@using System.Numerics
+@using PXEngine.Core
 @inject IJSRuntime JS
+@implements IAsyncDisposable
 
 <PageTitle>PX Engine</PageTitle>
 
-<canvas id="px-canvas" style="width:100%; height:70vh; display:block; touch-action:none;"></canvas>
+<div class="px-toolbar">
+    <button class="btn btn-sm btn-primary" disabled="@_playing" @onclick='() => AddActor("box")'>+ Cube</button>
+    <button class="btn btn-sm btn-primary" disabled="@_playing" @onclick='() => AddActor("sphere")'>+ Sphère</button>
+    <button class="btn btn-sm btn-danger" disabled="@(_selected == null || _playing)" @onclick="DeleteSelected">Supprimer</button>
+    <button class="btn btn-sm @(_playing ? "btn-warning" : "btn-success")" @onclick="TogglePlay">@(_playing ? "■ Stop" : "▶ Jouer")</button>
+</div>
+
+<div class="px-info">
+    @if (_playing)
+    {
+        <span>Mode jeu : appuie sur Stop pour revenir à l'éditeur</span>
+    }
+    else if (_selected != null)
+    {
+        <span>Sélection : <b>@_selected.Name</b></span>
+    }
+    else
+    {
+        <span>Touche un objet pour le sélectionner</span>
+    }
+</div>
+
+<canvas id="px-canvas"></canvas>
 
 @code {
     private IJSObjectReference? _module;
+    private DotNetObjectReference<Home>? _ref;
+    private readonly Scene _scene = new();
+    private Actor? _selected;
+    private bool _playing;
+    private int _count;
+    private Dictionary<int, (Vector3, Vector3, Vector3)> _snapshot = new();
 
-        protected override async Task OnAfterRenderAsync(bool firstRender)
+    // Positions des nouveaux objets, pour qu'ils ne se superposent pas
+    private static readonly float[] SpawnX = { 0f, 2.5f, -2.5f, 5f, -5f };
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (!firstRender) return;
+
+        // 1. On démarre l'affichage 3D
+        _module = await JS.InvokeAsync<IJSObjectReference>("import", "./js/pxengine.js");
+        _ref = DotNetObjectReference.Create(this);
+        await _module.InvokeVoidAsync("init", "px-canvas", _ref);
+
+        // 2. Le sol
+        var ground = _scene.Spawn("Sol");
+        ground.Transform.Position = new Vector3(0f, -0.75f, 0f);
+        var groundMesh = ground.AddComponent(new MeshComponent { Shape = "ground", Color = "#2a2a3a" });
+        await _module.InvokeVoidAsync("createMesh", ground.Id, groundMesh.Shape, groundMesh.Color);
+
+        // 3. Un premier cube
+        await AddActor("box");
+
+        // 4. On lance la boucle d'affichage
+        await _module.InvokeVoidAsync("startLoop");
+        StateHasChanged();
+    }
+
+    // Ajoute un Actor (cube ou sphère) dans la scène
+    private async Task AddActor(string shape)
+    {
+        if (_module == null) return;
+
+        var index = _count;
+        _count++;
+        var isSphere = shape == "sphere";
+        var actor = _scene.Spawn((isSphere ? "Sphère " : "Cube ") + _count);
+        actor.Transform.Position = new Vector3(SpawnX[index % 5], 0f, -(index / 5) * 2.5f);
+
+        var mesh = actor.AddComponent(new MeshComponent
+        {
+            Shape = shape,
+            Color = isSphere ? "#ff9933" : "#3399ff"
+        });
+        actor.AddComponent(new RotatorComponent());
+
+        await _module.InvokeVoidAsync("createMesh", actor.Id, mesh.Shape, mesh.Color);
+        await Select(actor);
+    }
+
+    private async Task Select(Actor? actor)
+    {
+        _selected = actor;
+        if (_module != null)
+            await _module.InvokeVoidAsync("setSelected", actor?.Id ?? 0);
+    }
+
+    private async Task DeleteSelected()
+    {
+        if (_selected == null || _module == null) return;
+        await _module.InvokeVoidAsync("destroyMesh", _selected.Id);
+        _scene.Destroy(_selected);
+        await Select(null);
+    }
+
+    // Jouer / Stop : comme dans Unreal, Stop remet tout à sa place d'origine
+    private async Task TogglePlay()
+    {
+        if (!_playing)
+        {
+            _snapshot = _scene.Actors.ToDictionary(
+                a => a.Id,
+                a => (a.Transform.Position, a.Transform.Rotation, a.Transform.Scale));
+            await Select(null);
+            _scene.Start();
+            _playing = true;
+        }
+        else
+        {
+            _playing = false;
+            foreach (var a in _scene.Actors)
             {
-                    if (firstRender)
-                            {
-                                        _module = await JS.InvokeAsync<IJSObjectReference>("import", "./js/pxengine.js");
-                                                    await _module.InvokeVoidAsync("init", "px-canvas");
-                                                            }
-                                                                }
-                                                                }
+                if (_snapshot.TryGetValue(a.Id, out var s))
+                {
+                    a.Transform.Position = s.Item1;
+                    a.Transform.Rotation = s.Item2;
+                    a.Transform.Scale = s.Item3;
+                }
+            }
+        }
+    }
+
+    // Appelé par le JavaScript quand on touche l'écran
+    [JSInvokable]
+    public async Task OnPick(int id)
+    {
+        if (_playing) return;
+        await Select(_scene.Actors.FirstOrDefault(a => a.Id == id));
+        StateHasChanged();
+    }
+
+    // Appelé par le JavaScript à chaque image
+    [JSInvokable]
+    public float[] Tick(float deltaTime)
+    {
+        if (_playing)
+            _scene.Update(deltaTime);
+
+        var data = new List<float>();
+        foreach (var a in _scene.Actors)
+        {
+            var t = a.Transform;
+            data.AddRange(new float[] {
+                a.Id,
+                t.Position.X, t.Position.Y, t.Position.Z,
+                t.Rotation.X, t.Rotation.Y, t.Rotation.Z,
+                t.Scale.X, t.Scale.Y, t.Scale.Z
+            });
+        }
+        return data.ToArray();
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        if (_module != null)
+        {
+            try
+            {
+                await _module.InvokeVoidAsync("dispose");
+                await _module.DisposeAsync();
+            }
+            catch (JSDisconnectedException) { }
+        }
+        _ref?.Dispose();
+    }
+}
